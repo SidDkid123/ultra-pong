@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>UltraPong</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-family: 'Press Start 2P', monospace;
+    user-select: none;
+  }
+  #game-container {
+    border: 3px solid #fff;
+    padding: 10px;
+    background: #000;
+    image-rendering: pixelated;
+    position: relative;
+  }
+  canvas {
+    width: 400px;   /* visual upscale; canvas is 800x600 internally */
+    height: 300px;
+    display: block;
+    background: #000;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  #pause-text {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 36px;
+    z-index: 10;
+  }
+  #start-screen, #end-screen, #glitch-overlay, #credits-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: none;
+  }
+  #start-screen {
+    background: #111;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  #start-screen button {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 24px;
+    color: #fff;
+    background: #222;
+    border: 2px solid #fff;
+    padding: 20px 40px;
+    margin: 15px;
+    cursor: pointer;
+  }
+  #start-screen button:hover { background: #555; }
+</style>
+</head>
+<body>
+<div id="game-container">
+  <canvas id="pong" width="800" height="600"></canvas>
+  <div id="pause-text">PAUSED</div>
+
+  <div id="start-screen">
+    <button id="btn-1p">1P</button>
+    <button id="btn-2p">2P</button>
+  </div>
+
+  <!-- overlays are drawn via canvas; these divs are just for layering -->
+  <div id="glitch-overlay"></div>
+  <div id="credits-overlay"></div>
+  <div id="end-screen"></div>
+</div>
+
+<script>
+/* =========================
+   Canvas & Elements
+========================= */
+const canvas = document.getElementById("pong");
+const ctx = canvas.getContext("2d");
+const pauseTextEl = document.getElementById("pause-text");
+const startScreen = document.getElementById("start-screen");
+const btn1P = document.getElementById("btn-1p");
+const btn2P = document.getElementById("btn-2p");
+
+/* =========================
+   Constants
+========================= */
+const WIDTH = canvas.width;   // 800
+const HEIGHT = canvas.height; // 600
+
+const PADDLE_WIDTH = 10;
+const PADDLE_HEIGHT = 100;
+const BALL_SIZE = 15;    // drawn as a 30x30 square (size is half-side)
+const DOT_SIZE = 15;     // per your preference (same half-size as ball square)
+const PADDLE_SPEED = 9;
+
+const MAX_BALL_SPEED = 12;
+const MAX_BOUNCE_ANGLE = Math.PI / 3; // 60°
+
+const DOT_GROUP_INTERVAL = 10000; // 10 seconds
+const MAX_DOTS = 8;
+
+/* =========================
+   Game Objects
+========================= */
+let leftPaddle  = { x: 30, y: Math.floor(HEIGHT/2 - PADDLE_HEIGHT/2), width: PADDLE_WIDTH, height: PADDLE_HEIGHT, dy: 0 };
+let rightPaddle = { x: WIDTH - 30 - PADDLE_WIDTH, y: Math.floor(HEIGHT/2 - PADDLE_HEIGHT/2), width: PADDLE_WIDTH, height: PADDLE_HEIGHT, dy: 0 };
+
+let ball = { x: Math.floor(WIDTH/2), y: Math.floor(HEIGHT/2), size: BALL_SIZE, dx: 3, dy: 2 };
+
+let scoreLeft = 0;
+let scoreRight = 0;
+
+let paused = false;
+let gameStarted = false;
+let singlePlayer = false;
+
+/* =========================
+   AI (human-like smooth)
+========================= */
+let aiErrorMargin = 0;  // small random offset to prediction
+let aiMoveSpeed = 0;    // smoothed dy for AI paddle
+
+/* =========================
+   Dots
+========================= */
+const DOT_COLORS = [
+  {color: 'white',  points:  1, rarity: 'common'},                 // +1 self
+  {color: 'blue',   points:  1, rarity: 'common'},                 // +1 self
+  {color: 'purple', points:  1, rarity: 'common'},                 // +1 self
+  {color: 'gold',   points:  2, rarity: 'rare'},                   // +2 self
+  {color: 'green',  points: -1, rarity: 'rare', target: 'other'},  // -1 opponent
+  {color: 'red',    points: -1, rarity: 'rare', target: 'self'}    // -1 self
+];
+let dots = [];
+let timeSinceLastGroup = 0;
+
+/* =========================
+   Game States
+========================= */
+let gameState = "menu"; // "menu" | "playing" | "glitch" | "credits" | "end"
+let glitchStart = 0;
+const GLITCH_DURATION = 10000; // 10s
+let glitchHasText = false;     // show impossible text during glitch?
+let creditsEnabled = false;    // credits after glitch?
+let winnerText = "";           // end text for non-credits cases
+
+/* =========================
+   Credits Animation
+========================= */
+let curtainY = 0;
+let curtainDuration = 2000; // 2s
+let curtainStart = 0;
+let creditsScrollY = HEIGHT + 80;
+let creditsScrollSpeed = 1.2;
+let creditsDone = false;
+
+/* =========================
+   Drawing Helpers
+========================= */
+function drawRect(x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.floor(x), Math.floor(y), Math.floor(w), Math.floor(h));
+}
+function drawText(text, x, y, color, size=40, center=false) {
+  ctx.fillStyle = color;
+  ctx.font = `bold ${size}px 'Press Start 2P', monospace`;
+  if (center) {
+    const m = ctx.measureText(text);
+    x = Math.floor(x - m.width / 2);
+  } else {
+    x = Math.floor(x);
+  }
+  ctx.fillText(text, x, Math.floor(y));
+}
+function drawMidLine() {
+  for (let i = 0; i < HEIGHT; i += 30) {
+    drawRect(WIDTH/2 - 1, i, 2, 20, "white");
+  }
+}
+function drawBall(rainbow=false, t=0) {
+  let color = "white";
+  if (rainbow) {
+    const hue = Math.floor((t / 10) % 360);
+    color = `hsl(${hue}, 95%, 60%)`;
+  }
+  drawRect(ball.x - ball.size, ball.y - ball.size, ball.size * 2, ball.size * 2, color);
+}
+function drawDots() {
+  for (const d of dots) {
+    drawRect(d.x - DOT_SIZE/2, d.y - DOT_SIZE/2, DOT_SIZE, DOT_SIZE, d.color);
+  }
+}
+
+/* =========================
+   Audio (glitch beeps)
+========================= */
+let audioCtx = null;
+function playBeep(volume=0.8, duration=0.06, freq=220) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.value = freq;
+    gain.gain.value = volume;
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+
+    setTimeout(() => {
+      osc.stop();
+      osc.disconnect();
+      gain.disconnect();
+    }, duration * 1000);
+  } catch (e) {/* ignore */}
+}
+
+/* =========================
+   Ball Serve & Speed
+========================= */
+function centerBallAndServe() {
+  // Put ball at center and serve slowly, slight angle (ponggame-like feel)
+  ball.x = Math.floor(WIDTH/2);
+  ball.y = Math.floor(HEIGHT/2);
+  const base = 3; // slow base speed on serve
+  const angle = (Math.random() * 0.6 - 0.3); // ±~17°
+  const dir = Math.random() < 0.5 ? -1 : 1;
+  ball.dx = Math.cos(angle) * base * dir;
+  ball.dy = Math.sin(angle) * base * (Math.random() < 0.5 ? -1 : 1);
+}
+function increaseSpeedGentle() {
+  // +10% on each paddle hit, capped
+  let speed = Math.hypot(ball.dx, ball.dy);
+  let newSpeed = Math.min(MAX_BALL_SPEED, speed * 1.10);
+  if (newSpeed !== speed) {
+    const s = newSpeed / speed;
+    ball.dx *= s;
+    ball.dy *= s;
+  }
+}
+
+/* =========================
+   Paddle Bounce Angles
+========================= */
+function applyBounceAngle(paddle, fromLeftSide) {
+  // relative impact point (-1 top .. +1 bottom)
+  const rel = (ball.y - (paddle.y + paddle.height/2)) / (paddle.height/2);
+  const relClamped = Math.max(-1, Math.min(1, rel));
+  const angle = relClamped * MAX_BOUNCE_ANGLE;
+
+  // keep the same speed magnitude, only change direction
+  let speed = Math.hypot(ball.dx, ball.dy);
+  speed = Math.min(MAX_BALL_SPEED, Math.max(3, speed));
+  const dir = fromLeftSide ? 1 : -1; // leaving to the right if left paddle, to the left if right paddle
+
+  ball.dx = Math.cos(angle) * speed * dir;
+  ball.dy = Math.sin(angle) * speed;
+}
+
+/* =========================
+   AI (prediction + smooth)
+========================= */
+function predictBallY() {
+  const frames = (ball.x - leftPaddle.x - leftPaddle.width) / ball.dx;
+  if (frames <= 0) return ball.y;
+  let y = ball.y + ball.dy * frames;
+  // reflect predicted y across top/bottom bounds
+  while (y < 0 || y > HEIGHT) {
+    if (y < 0) y = -y;
+    if (y > HEIGHT) y = 2 * HEIGHT - y;
+  }
+  return y;
+}
+function updateAI() {
+  // Only chase when ball is coming left and not too far right
+  if (ball.dx >= 0 || ball.x > WIDTH * 0.75) {
+    leftPaddle.dy = 0;
+    aiMoveSpeed *= 0.85; // natural slow-down
+    leftPaddle.y += aiMoveSpeed;
+    return;
+  }
+
+  // Tiny error tweaks occasionally so it feels human
+  if (Math.random() < 0.008) aiErrorMargin = (Math.random() * 12) - 6; // ±6px
+
+  const target = predictBallY() + aiErrorMargin;
+  const center = leftPaddle.y + PADDLE_HEIGHT/2;
+  const diff = target - center;
+
+  const accel = 0.28;   // gentle acceleration
+  const damping = 0.90; // smoother decel
+
+  if (diff > 8) aiMoveSpeed += accel;
+  else if (diff < -8) aiMoveSpeed -= accel;
+  else aiMoveSpeed *= damping;
+
+  // Cap like a human player
+  const cap = PADDLE_SPEED * 0.95;
+  if (aiMoveSpeed >  cap) aiMoveSpeed =  cap;
+  if (aiMoveSpeed < -cap) aiMoveSpeed = -cap;
+
+  leftPaddle.y += aiMoveSpeed;
+
+  // Clamp
+  if (leftPaddle.y < 0) { leftPaddle.y = 0; aiMoveSpeed = 0; }
+  if (leftPaddle.y + PADDLE_HEIGHT > HEIGHT) { leftPaddle.y = HEIGHT - PADDLE_HEIGHT; aiMoveSpeed = 0; }
+}
+
+/* =========================
+   Dots (spawn/update/collide)
+========================= */
+function spawnDotGroup() {
+  if (dots.length >= MAX_DOTS) return;
+  const groupSize = Math.min(6 + Math.floor(Math.random()*3), MAX_DOTS - dots.length); // 6–8
+  for (let i = 0; i < groupSize; i++) {
+    const rand = Math.random();
+    let type;
+    if (rand < 0.7) {
+      // common (white/blue/purple)
+      type = DOT_COLORS[Math.floor(Math.random()*3)];
+    } else {
+      // rare (gold/green/red)
+      type = DOT_COLORS[3 + Math.floor(Math.random()*3)];
+    }
+    const x = Math.random() * (WIDTH - DOT_SIZE*2) + DOT_SIZE;
+    const y = -Math.random() * 300; // stagger above screen
+    dots.push({
+      x, y,
+      color: type.color,
+      points: type.points,
+      target: type.target || 'self',
+      speed: 1.5 + Math.random() // 1.5–2.5
+    });
+  }
+}
+function updateDots() {
+  for (let i = dots.length - 1; i >= 0; i--) {
+    const d = dots[i];
+    d.y += d.speed;
+    if (d.y > HEIGHT + DOT_SIZE) { dots.splice(i, 1); continue; }
+
+    // Simple square/circle-ish check
+    const dx = Math.abs(ball.x - d.x);
+    const dy = Math.abs(ball.y - d.y);
+    const hitDist = ball.size + DOT_SIZE/2;
+    if (dx < hitDist && dy < hitDist) {
+      const isLeftSide = d.x < WIDTH/2;
+      if (d.target === 'other') {
+        // green: subtract from opponent
+        if (isLeftSide) scoreRight = Math.max(0, scoreRight + d.points);
+        else scoreLeft = Math.max(0, scoreLeft + d.points);
+      } else if (d.target === 'self' && d.points < 0) {
+        // red: subtract from same side
+        if (isLeftSide) scoreLeft = Math.max(0, scoreLeft + d.points);
+        else scoreRight = Math.max(0, scoreRight + d.points);
+      } else {
+        // positive for same side
+        if (isLeftSide) scoreLeft = Math.max(0, scoreLeft + d.points);
+        else scoreRight = Math.max(0, scoreRight + d.points);
+      }
+      dots.splice(i, 1);
+    }
+  }
+}
+
+/* =========================
+   Scoring & Win → Glitch
+========================= */
+function checkWinAndTrigger() {
+  if (scoreLeft >= 50 || scoreRight >= 50) {
+    gameState = "glitch";
+    glitchStart = performance.now();
+
+    if (singlePlayer) {
+      if (scoreRight >= 50) { // Human (right) wins in 1P
+        glitchHasText = true;
+        creditsEnabled = true;
+        winnerText = "";
+      } else { // AI (left) wins
+        glitchHasText = false;
+        creditsEnabled = false;
+        winnerText = "YOU LOST";
+      }
+    } else {
+      // 2P mode
+      if (scoreLeft >= 50) { // Player 1 wins
+        glitchHasText = true;
+        creditsEnabled = true;
+        winnerText = "";
+      } else { // Player 2 wins
+        glitchHasText = false;
+        creditsEnabled = false;
+        winnerText = "PLAYER 2 HAS WON!";
+      }
+    }
+  }
+}
+
+/* =========================
+   Update Loop (Playing)
+========================= */
+function update(deltaTime) {
+  if (gameState !== "playing" || paused) return;
+
+  if (singlePlayer) updateAI();
+
+  // paddle motion
+  leftPaddle.y += leftPaddle.dy;
+  rightPaddle.y += rightPaddle.dy;
+
+  // clamp paddles
+  if (leftPaddle.y < 0) leftPaddle.y = 0;
+  if (leftPaddle.y + PADDLE_HEIGHT > HEIGHT) leftPaddle.y = HEIGHT - PADDLE_HEIGHT;
+  if (rightPaddle.y < 0) rightPaddle.y = 0;
+  if (rightPaddle.y + PADDLE_HEIGHT > HEIGHT) rightPaddle.y = HEIGHT - PADDLE_HEIGHT;
+
+  // ball physics
+  ball.x += ball.dx;
+  ball.y += ball.dy;
+
+  // top/bottom walls
+  if (ball.y - ball.size < 0 || ball.y + ball.size > HEIGHT) {
+    ball.dy = -ball.dy;
+  }
+
+  // paddle collisions with angle + gentle speed-up
+  // left paddle (AI or P1)
+  if (ball.dx < 0 &&
+      ball.x - ball.size < leftPaddle.x + leftPaddle.width &&
+      ball.y > leftPaddle.y && ball.y < leftPaddle.y + leftPaddle.height) {
+    increaseSpeedGentle();
+    applyBounceAngle(leftPaddle, true);
+  }
+
+  // right paddle (human P2 or human in 1P)
+  if (ball.dx > 0 &&
+      ball.x + ball.size > rightPaddle.x &&
+      ball.y > rightPaddle.y && ball.y < rightPaddle.y + rightPaddle.height) {
+    increaseSpeedGentle();
+    applyBounceAngle(rightPaddle, false);
+  }
+
+  // goals
+  if (ball.x - ball.size < 0) {
+    scoreRight++;
+    centerBallAndServe();       // serve slow after a point
+  } else if (ball.x + ball.size > WIDTH) {
+    scoreLeft++;
+    centerBallAndServe();       // serve slow after a point
+  }
+
+  // dots update & spawn
+  timeSinceLastGroup += deltaTime;
+  if (timeSinceLastGroup > DOT_GROUP_INTERVAL) {
+    spawnDotGroup();
+    timeSinceLastGroup = 0;
+  }
+  updateDots();
+
+  // check victory
+  checkWinAndTrigger();
+}
+
+/* =========================
+   Glitch / Credits / End
+========================= */
+function drawGlitch(now) {
+  // Base frame of gameplay (with rainbow ball)
+  drawRect(0,0,WIDTH,HEIGHT,"black");
+  drawMidLine();
+  drawRect(leftPaddle.x, leftPaddle.y, PADDLE_WIDTH, PADDLE_HEIGHT, "white");
+  drawRect(rightPaddle.x, rightPaddle.y, PADDLE_WIDTH, PADDLE_HEIGHT, "white");
+  drawBall(true, now);
+  drawDots();
+  drawText(scoreLeft, WIDTH/4 - 20, 50, "white", 40, false);
+  drawText(scoreRight, WIDTH*3/4 - 20, 50, "white", 40, false);
+
+  // Flicker overlay (random)
+  if (Math.random() < 0.25) {
+    drawRect(0,0,WIDTH,HEIGHT,"black");
+    if (glitchHasText) {
+      drawText("YOU CANNOT HAVE MADE IT THIS FAR", WIDTH/2, HEIGHT/2 - 30, "#fff", 20, true);
+      drawText("IT IS... IMPOSSIBLE", WIDTH/2, HEIGHT/2 + 10, "#fff", 20, true);
+    }
+  }
+}
+
+function drawCredits(now) {
+  // Credits background
+  drawRect(0,0,WIDTH,HEIGHT,"#000");
+
+  // Credits text (revealed under curtain)
+  const baseY = creditsScrollY;
+  drawText("ULTRAPONG", WIDTH/2, baseY, "#fff", 30, true);
+  drawText("Code & Design: Sid", WIDTH/2, baseY + 60, "#fff", 18, true);
+  drawText("Special Effects: ChatGPT", WIDTH/2, baseY + 100, "#fff", 18, true);
+  drawText("Inspired by the 1972 classic", WIDTH/2, baseY + 140, "#fff", 18, true);
+  drawText("Thanks for playing!", WIDTH/2, baseY + 200, "#fff", 18, true);
+
+  // Curtain drop (black rectangle sliding down)
+  const elapsed = now - curtainStart;
+  const progress = Math.min(1, elapsed / curtainDuration);
+  curtainY = Math.floor(HEIGHT * progress);
+  drawRect(0, curtainY, WIDTH, HEIGHT - curtainY, "#000");
+
+  // After fully revealed, scroll
+  if (progress >= 1) {
+    creditsScrollY -= creditsScrollSpeed;
+    if (creditsScrollY < -140) {
+      creditsDone = true;
+      drawText("Press any key to restart", WIDTH/2, HEIGHT - 60, "#fff", 16, true);
+    }
+  }
+}
+
+function drawEnd() {
+  drawRect(0,0,WIDTH,HEIGHT,"#000");
+  drawText(winnerText, WIDTH/2, HEIGHT/2 - 20, "#fff", 22, true);
+  drawText("Press any key to restart", WIDTH/2, HEIGHT/2 + 30, "#fff", 16, true);
+}
+
+/* =========================
+   Input
+========================= */
+document.addEventListener("keydown", (e) => {
+  if (gameState === "menu") return; // start via buttons
+
+  if (gameState === "glitch" || gameState === "credits" || gameState === "end") {
+    // Only allow restart once credits done or end screen is shown
+    if (gameState === "end" || (gameState === "credits" && creditsDone)) {
+      restartToMenu();
+    }
+    return;
+  }
+
+  switch (e.key) {
+    case "w": case "W":
+      if (!singlePlayer) leftPaddle.dy = -PADDLE_SPEED; break;
+    case "s": case "S":
+      if (!singlePlayer) leftPaddle.dy =  PADDLE_SPEED; break;
+    case "ArrowUp":
+      rightPaddle.dy = -PADDLE_SPEED; break;
+    case "ArrowDown":
+      rightPaddle.dy =  PADDLE_SPEED; break;
+    case "p": case "P":
+      if (gameState === "playing") {
+        paused = !paused;
+        pauseTextEl.style.display = paused ? "flex" : "none";
+      }
+      break;
+  }
+});
+
+document.addEventListener("keyup", (e) => {
+  if (gameState !== "playing") return;
+  switch (e.key) {
+    case "w": case "W":
+    case "s": case "S":
+      if (!singlePlayer) leftPaddle.dy = 0; break;
+    case "ArrowUp":
+    case "ArrowDown":
+      rightPaddle.dy = 0; break;
+  }
+});
+
+btn1P.onclick = () => { singlePlayer = true; startGame(); };
+btn2P.onclick = () => { singlePlayer = false; startGame(); };
+
+/* =========================
+   Game Flow
+========================= */
+function startGame() {
+  gameStarted = true;
+  gameState = "playing";
+  paused = false;
+  pauseTextEl.style.display = "none";
+  startScreen.style.display = "none";
+
+  scoreLeft = 0;
+  scoreRight = 0;
+  leftPaddle.y = Math.floor(HEIGHT/2 - PADDLE_HEIGHT/2);
+  rightPaddle.y = Math.floor(HEIGHT/2 - PADDLE_HEIGHT/2);
+
+  dots = [];
+  timeSinceLastGroup = 0;
+
+  centerBallAndServe();
+}
+
+function restartToMenu() {
+  gameState = "menu";
+  gameStarted = false;
+  startScreen.style.display = "flex";
+  // Reset credits variables
+  creditsScrollY = HEIGHT + 80;
+  creditsDone = false;
+  curtainY = 0;
+}
+
+/* =========================
+   Main Loop
+========================= */
+let lastTime = performance.now();
+
+function loop() {
+  const now = performance.now();
+  const delta = now - lastTime;
+  lastTime = now;
+
+  // UPDATE
+  if (gameState === "playing") {
+    update(delta);
+  } else if (gameState === "glitch") {
+    // Keep some chaotic motion + loud beeps on paddle collisions
+    ball.x += ball.dx;
+    ball.y += ball.dy;
+    if (ball.y - ball.size < 0 || ball.y + ball.size > HEIGHT) ball.dy = -ball.dy;
+
+    // collide with paddles during glitch for extra beeps
+    if (ball.dx < 0 &&
+        ball.x - ball.size < leftPaddle.x + leftPaddle.width &&
+        ball.y > leftPaddle.y && ball.y < leftPaddle.y + leftPaddle.height) {
+      ball.dx = -ball.dx;
+      playBeep(1.0, 0.08, 280);
+    }
+    if (ball.dx > 0 &&
+        ball.x + ball.size > rightPaddle.x &&
+        ball.y > rightPaddle.y && ball.y < rightPaddle.y + rightPaddle.height) {
+      ball.dx = -ball.dx;
+      playBeep(1.0, 0.08, 320);
+    }
+
+    if (now - glitchStart >= GLITCH_DURATION) {
+      if (creditsEnabled) {
+        gameState = "credits";
+        curtainStart = now;
+      } else {
+        gameState = "end";
+      }
+    }
+  } else if (gameState === "credits") {
+    // animation handled in draw
+  } else if (gameState === "end") {
+    // static
+  }
+
+  // DRAW
+  if (gameState === "menu") {
+    drawRect(0,0,WIDTH,HEIGHT,"black");
+  } else if (gameState === "playing") {
+    drawRect(0,0,WIDTH,HEIGHT,"black");
+    if (!paused) drawMidLine(); // hide midline while paused
+    drawRect(leftPaddle.x, leftPaddle.y, PADDLE_WIDTH, PADDLE_HEIGHT, "white");
+    drawRect(rightPaddle.x, rightPaddle.y, PADDLE_WIDTH, PADDLE_HEIGHT, "white");
+    drawBall(false, now);
+    drawDots();
+    drawText(scoreLeft, WIDTH/4 - 20, 50, "white", 40, false);
+    drawText(scoreRight, WIDTH*3/4 - 20, 50, "white", 40, false);
+  } else if (gameState === "glitch") {
+    drawGlitch(now);
+  } else if (gameState === "credits") {
+    drawCredits(now);
+  } else if (gameState === "end") {
+    drawEnd();
+  }
+
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
